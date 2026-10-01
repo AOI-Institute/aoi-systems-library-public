@@ -1,0 +1,350 @@
+import os
+import json
+import time
+import datetime
+import sqlite3
+from typing import Any, Dict, Optional
+
+import stripe
+
+# Stripe configuration
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+
+# Price IDs mapping
+PRICE_IDS = {
+    "solo": "price_1UIxxxxxx_solo",
+    "team": "price_1UIxxxxxx_team",
+    "enterprise": "price_1UIxxxxxx_enterprise",
+}
+
+# Database schema
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS subscriptions (
+    stripe_subscription_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    cancelled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+    stripe_invoice_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    paid_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS refunds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    executed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    stripe_event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    processed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    details TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+def iso_now() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+class Database:
+    def __init__(self, db_path: str = ":memory:"):
+        self.conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.executescript(SCHEMA_SQL)
+        self.conn.commit()
+
+    def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        self.conn.commit()
+        return cur
+
+    def fetchone(self, query: str, params: tuple = ()) -> Optional[tuple]:
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        return cur.fetchone()
+
+    def fetchall(self, query: str, params: tuple = ()) -> list:
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        return cur.fetchall()
+
+class BillingSystem:
+    def __init__(self, db_path: str = ":memory:"):
+        self.db = Database(db_path)
+
+    def audit_log(self, action: str, details: Dict[str, Any]) -> None:
+        self.db.execute(
+            "INSERT INTO audit_logs (action, details, created_at) VALUES (?, ?, ?)",
+            (action, json.dumps(details), iso_now()),
+        )
+
+    def create_subscription(self, customer_id: str, tier: str) -> Dict[str, Any]:
+        if tier not in PRICE_IDS:
+            return {"error": "invalid_tier", "message": f"Tier '{tier}' is not valid."}
+
+        try:
+            stripe_sub = stripe.Subscription.create(
+                customer=customer_id,
+                items=[{"price": PRICE_IDS[tier]}],
+            )
+        except stripe.error.StripeError as e:
+            return {"error": "stripe_error", "message": str(e)}
+
+        created_at = iso_now()
+        self.db.execute(
+            """
+            INSERT INTO subscriptions (
+                stripe_subscription_id, customer_id, tier, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stripe_sub.id,
+                customer_id,
+                tier,
+                stripe_sub.status,
+                created_at,
+                created_at,
+            ),
+        )
+        self.audit_log(
+            "subscription_created",
+            {
+                "customer_id": customer_id,
+                "tier": tier,
+                "stripe_sub_id": stripe_sub.id,
+            },
+        )
+        next_billing_date = datetime.datetime.utcfromtimestamp(
+            stripe_sub.current_period_end
+        ).isoformat() + "Z"
+
+        return {
+            "success": True,
+            "subscription_id": stripe_sub.id,
+            "tier": tier,
+            "status": stripe_sub.status,
+            "next_billing_date": next_billing_date,
+        }
+
+    def change_plan(self, subscription_id: str, new_tier: str) -> Dict[str, Any]:
+        if new_tier not in PRICE_IDS:
+            return {"error": "invalid_tier", "message": f"Tier '{new_tier}' is not valid."}
+
+        sub_record = self.db.fetchone(
+            "SELECT tier, status FROM subscriptions WHERE stripe_subscription_id = ?",
+            (subscription_id,),
+        )
+        if not sub_record:
+            return {"error": "subscription_not_found", "message": "Subscription not found."}
+
+        old_tier, old_status = sub_record
+        try:
+            stripe_sub = stripe.Subscription.modify(
+                subscription_id,
+                items=[{"price": PRICE_IDS[new_tier]}],
+                proration_behavior="create_prorations",
+            )
+        except stripe.error.StripeError as e:
+            return {"error": "stripe_error", "message": str(e)}
+
+        proration_credit = 0
+        if stripe_sub.proration_amounts:
+            # Stripe returns proration_amounts as list of dicts with amount in cents
+            proration_credit = sum(
+                amt.get("amount", 0) for amt in stripe_sub.proration_amounts
+            ) / 100.0
+
+        updated_at = iso_now()
+        self.db.execute(
+            """
+            UPDATE subscriptions
+            SET tier = ?, status = ?, updated_at = ?
+            WHERE stripe_subscription_id = ?
+            """,
+            (new_tier, stripe_sub.status, updated_at, subscription_id),
+        )
+        self.audit_log(
+            "plan_changed",
+            {
+                "subscription_id": subscription_id,
+                "old_tier": old_tier,
+                "new_tier": new_tier,
+                "proration_credits": proration_credit,
+            },
+        )
+        effective_date = datetime.datetime.utcfromtimestamp(
+            stripe_sub.current_period_start
+        ).isoformat() + "Z"
+
+        return {
+            "success": True,
+            "subscription_id": subscription_id,
+            "old_tier": old_tier,
+            "new_tier": new_tier,
+            "effective_date": effective_date,
+            "proration_credit": proration_credit,
+        }
+
+    def queue_refund(self, invoice_id: str, amount: int, reason: str, created_by: str) -> Dict[str, Any]:
+        invoice = self.db.fetchone(
+            "SELECT amount, status FROM invoices WHERE stripe_invoice_id = ?",
+            (invoice_id,),
+        )
+        if not invoice:
+            return {"error": "invoice_not_found", "message": "Invoice not found."}
+        invoice_amount, status = invoice
+        if status != "succeeded":
+            return {"error": "invoice_not_succeeded", "message": "Invoice not succeeded."}
+        if amount > invoice_amount:
+            return {"error": "refund_exceeds_invoice", "message": "Refund amount exceeds invoice."}
+
+        created_at = iso_now()
+        cur = self.db.execute(
+            """
+            INSERT INTO refunds (invoice_id, amount, status, reason, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (invoice_id, amount, "queued", reason, created_by, created_at),
+        )
+        refund_id = cur.lastrowid
+        self.audit_log(
+            "refund_queued",
+            {"invoice_id": invoice_id, "amount": amount, "reason": reason},
+        )
+        return {
+            "success": True,
+            "refund_id": refund_id,
+            "status": "queued",
+            "amount": amount,
+            "reason": reason,
+        }
+
+    def handle_stripe_webhook(self, payload: str, sig_header: str) -> Dict[str, Any]:
+        webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+        if not webhook_secret:
+            return {"error": "missing_webhook_secret", "message": "Webhook secret not configured."}
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, webhook_secret
+            )
+        except stripe.error.SignatureVerificationError:
+            return {"error": "invalid_signature", "message": "Invalid signature."}
+        except Exception as e:
+            return {"error": "invalid_payload", "message": str(e)}
+
+        # Idempotency check
+        existing = self.db.fetchone(
+            "SELECT 1 FROM events WHERE stripe_event_id = ?", (event.id,)
+        )
+        if existing:
+            return {"received": True}
+
+        # Process event
+        if event.type == "invoice.payment_succeeded":
+            invoice = event.data.object
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO invoices (
+                    stripe_invoice_id, customer_id, amount, status, paid_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    invoice.id,
+                    invoice.customer,
+                    invoice.amount_paid,
+                    "succeeded",
+                    iso_now(),
+                ),
+            )
+            self.audit_log(
+                "payment_succeeded",
+                {
+                    "customer_id": invoice.customer,
+                    "invoice_id": invoice.id,
+                    "amount": invoice.amount_paid,
+                },
+            )
+        elif event.type == "invoice.payment_failed":
+            invoice = event.data.object
+            # Find subscription linked to this invoice
+            sub = stripe.Invoice.retrieve(invoice.id).subscription
+            if sub:
+                self.db.execute(
+                    """
+                    UPDATE subscriptions
+                    SET status = ?, updated_at = ?
+                    WHERE stripe_subscription_id = ?
+                    """,
+                    ("past_due", iso_now(), sub),
+                )
+            self.audit_log(
+                "payment_failed",
+                {
+                    "customer_id": invoice.customer,
+                    "invoice_id": invoice.id,
+                    "reason": invoice.failure_reason,
+                },
+            )
+        elif event.type == "customer.subscription.updated":
+            sub = event.data.object
+            tier = sub.items.data[0].price.lookup_key
+            status = sub.status
+            self.db.execute(
+                """
+                UPDATE subscriptions
+                SET tier = ?, status = ?, updated_at = ?
+                WHERE stripe_subscription_id = ?
+                """,
+                (tier, status, iso_now(), sub.id),
+            )
+            self.audit_log(
+                "subscription_updated",
+                {
+                    "customer_id": sub.customer,
+                    "old_tier": None,  # Not available in webhook
+                    "new_tier": tier,
+                },
+            )
+        elif event.type == "customer.subscription.deleted":
+            sub = event.data.object
+            self.db.execute(
+                """
+                UPDATE subscriptions
+                SET status = ?, cancelled_at = ?, updated_at = ?
+                WHERE stripe_subscription_id = ?
+                """,
+                ("cancelled", iso_now(), iso_now(), sub.id),
+            )
+            self.audit_log(
+                "subscription_cancelled",
+                {"customer_id": sub.customer},
+            )
+
+        # Record event as processed
+        self.db.execute(
+            "INSERT INTO events (stripe_event_id, event_type, processed_at) VALUES (?, ?, ?)",
+            (event.id, event.type, iso_now()),
+        )
+
+        return {"received": True}

@@ -1,0 +1,157 @@
+import pytest
+import time
+import threading
+from health_checks_python import (
+    register_check,
+    liveness,
+    readiness,
+    set_store,
+    InMemoryHealthCheckStore,
+    SqliteHealthCheckStore
+)
+
+
+def setup_module(module):
+    set_store(InMemoryHealthCheckStore())
+
+
+def teardown_module(module):
+    set_store(InMemoryHealthCheckStore())
+
+
+def test_all_checks_pass_returns_200_pass():
+    def check_ok():
+        return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
+    
+    register_check("db", "datastore", check_ok, critical=True, timeout_ms=1000)
+    register_check("cache", "cache", check_ok, critical=False, timeout_ms=1000)
+    
+    result = readiness()
+    
+    assert result["http_status"] == 200
+    assert result["content_type"] == "application/health+json"
+    assert result["body"]["status"] == "pass"
+    assert "db:datastore" in result["body"]["checks"]
+    assert "cache:cache" in result["body"]["checks"]
+    assert result["body"]["checks"]["db:datastore"][0]["status"] == "pass"
+    assert result["body"]["checks"]["cache:cache"][0]["status"] == "pass"
+
+
+def test_critical_check_fails_returns_503_fail():
+    def check_fail():
+        return {"status": "fail", "observedValue": 0, "observedUnit": "ms"}
+    
+    register_check("db", "datastore", check_fail, critical=True, timeout_ms=1000)
+    
+    result = readiness()
+    
+    assert result["http_status"] == 503
+    assert result["content_type"] == "application/health+json"
+    assert result["body"]["status"] == "fail"
+    assert result["body"]["checks"]["db:datastore"][0]["status"] == "fail"
+
+
+def test_only_non_critical_fails_returns_200_warn():
+    def check_ok():
+        return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
+    
+    def check_fail():
+        return {"status": "fail", "observedValue": 0, "observedUnit": "ms"}
+    
+    register_check("db", "datastore", check_ok, critical=True, timeout_ms=1000)
+    register_check("cache", "cache", check_fail, critical=False, timeout_ms=1000)
+    
+    result = readiness()
+    
+    assert result["http_status"] == 200
+    assert result["content_type"] == "application/health+json"
+    assert result["body"]["status"] == "warn"
+    assert result["body"]["checks"]["db:datastore"][0]["status"] == "pass"
+    assert result["body"]["checks"]["cache:cache"][0]["status"] == "fail"
+
+
+def test_slow_check_past_timeout_returns_fail_for_that_check():
+    def slow_check():
+        time.sleep(0.5)
+        return {"status": "pass", "observedValue": 500, "observedUnit": "ms"}
+    
+    register_check("slow", "service", slow_check, critical=True, timeout_ms=100)
+    
+    result = readiness()
+    
+    assert result["http_status"] == 503
+    assert result["content_type"] == "application/health+json"
+    assert result["body"]["status"] == "fail"
+    assert result["body"]["checks"]["slow:service"][0]["status"] == "fail"
+
+
+def test_liveness_stays_pass_even_when_dependency_check_would_fail():
+    def check_fail():
+        return {"status": "fail", "observedValue": 0, "observedUnit": "ms"}
+    
+    register_check("db", "datastore", check_fail, critical=True, timeout_ms=1000)
+    
+    result = liveness()
+    
+    assert result["http_status"] == 200
+    assert result["content_type"] == "application/health+json"
+    assert result["body"]["status"] == "pass"
+    assert "checks" in result["body"]
+    assert result["body"]["checks"] == {}
+
+
+def test_output_contains_no_connection_string():
+    def check_with_secret():
+        return {"status": "pass", "observedValue": 1, "observedUnit": "ms"}
+    
+    register_check("db", "datastore", check_with_secret, critical=True, timeout_ms=1000)
+    
+    result = readiness()
+    
+    body_str = str(result["body"])
+    assert "password" not in body_str.lower()
+    assert "connection" not in body_str.lower()
+    assert "secret" not in body_str.lower()
+    assert "token" not in body_str.lower()
+
+
+def test_sqlite_store_persists_across_calls():
+    store = SqliteHealthCheckStore(":memory:")
+    set_store(store)
+    
+    def check_ok():
+        return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
+    
+    register_check("db", "datastore", check_ok, critical=True, timeout_ms=1000)
+    
+    result1 = readiness()
+    assert result1["body"]["status"] == "pass"
+    
+    result2 = readiness()
+    assert result2["body"]["status"] == "pass"
+    assert "db:datastore" in result2["body"]["checks"]
+
+
+def test_multiple_threads_see_same_store():
+    store = InMemoryHealthCheckStore()
+    set_store(store)
+    
+    def check_ok():
+        return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
+    
+    def register_from_thread():
+        register_check(f"comp-{threading.current_thread().ident}", "service", check_ok, critical=True, timeout_ms=1000)
+    
+    threads = [threading.Thread(target=register_from_thread) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    
+    result = readiness()
+    assert result["body"]["status"] == "pass"
+    assert len(result["body"]["checks"]) == 5
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

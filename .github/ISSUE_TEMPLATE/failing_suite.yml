@@ -1,0 +1,24 @@
+name: Failing suite
+description: A system/language suite that fails (a good first issue to pick up)
+labels: ["failing-suite"]
+body:
+  - type: input
+    id: system
+    attributes: {label: System, placeholder: webhooks}
+    validations: {required: true}
+  - type: dropdown
+    id: lang
+    attributes:
+      label: Language
+      options: [csharp, go, java, javascript, php, python, rust, typescript]
+    validations: {required: true}
+  - type: textarea
+    id: output
+    attributes:
+      label: Failure output
+      description: Output of `python tools/run_suites.py --lang <lang> --systems <system>`
+      render: text
+    validations: {required: true}
+  - type: textarea
+    id: cause
+    attributes: {label: Suspected cause (optional)}

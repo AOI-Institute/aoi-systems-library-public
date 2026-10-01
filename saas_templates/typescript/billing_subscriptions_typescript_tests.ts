@@ -1,0 +1,474 @@
+import { Pool } from 'pg';
+import Stripe from 'stripe';
+import {
+  CREATE_TABLES_SQL,
+  initialize,
+  create_subscription,
+  change_plan,
+  queue_refund,
+  handle_stripe_webhook
+} from './billing_subscriptions_typescript';
+
+// Mock Stripe
+jest.mock('stripe');
+
+// Mock pg
+jest.mock('pg', () => {
+  const originalModule = jest.requireActual('pg');
+  return {
+    ...originalModule,
+    Pool: jest.fn().mockImplementation(() => {
+      return {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn(),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+    })
+  };
+});
+
+describe('Billing Subscriptions System', () => {
+  const mockStripe = {
+    subscriptions: {
+      create: jest.fn(),
+      update: jest.fn()
+    },
+    webhooks: {
+      constructEvent: jest.fn()
+    }
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.STRIPE_SECRET_KEY = 'sk_test_...';
+    process.env.STRIPE_WEBHOOK_SECRET = 'whsec_...';
+    process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
+    
+    // Initialize with mocks
+    initialize(process.env.STRIPE_SECRET_KEY, process.env.DATABASE_URL);
+    
+    // Replace internal stripe instance with mock
+    // @ts-ignore
+    require('./billing_subscriptions_typescript')._stripe = mockStripe as any;
+  });
+
+  describe('create_subscription', () => {
+    it('should create subscription successfully', async () => {
+      const mockSubscription = {
+        id: 'sub_123',
+        customer: 'cus_123',
+        status: 'active',
+        current_period_end: Math.floor(Date.now() / 1000) + 2592000, // 30 days from now
+        items: {
+          data: [
+            {
+              price: {
+                lookup_key: 'price_solo'
+              }
+            }
+          ]
+        }
+      };
+      mockStripe.subscriptions.create.mockResolvedValue(mockSubscription);
+      
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn(),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      mockPool.connect.mockResolvedValue({
+        query: jest.fn().mockImplementation((text, params) => {
+          if (text.includes('INSERT INTO subscriptions')) {
+            return Promise.resolve({ rows: [{ id: 1, stripe_subscription_id: 'sub_123', customer_id: 'cus_123', tier: 'price_solo', status: 'active', created_at: new Date() }] });
+          }
+          if (text.includes('INSERT INTO audit_log')) {
+            return Promise.resolve({});
+          }
+          return Promise.resolve({});
+        }),
+        release: jest.fn(),
+        rollback: jest.fn(),
+        commit: jest.fn()
+      });
+
+      const result = await create_subscription('cus_123', 'price_solo');
+      expect(result).toEqual({
+        success: true,
+        subscription_id: 'sub_123',
+        tier: 'price_solo',
+        status: 'active',
+        next_billing_date: expect.any(String)
+      });
+      expect(mockStripe.subscriptions.create).toHaveBeenCalledWith({
+        customer: 'cus_123',
+        items: [{ price: 'price_solo' }],
+        expand: ['latest_invoice.payment_intent']
+      });
+    });
+
+    it('should return invalid_tier error for invalid tier', async () => {
+      const result = await create_subscription('cus_123', 'invalid_tier');
+      expect(result).toEqual({ error: 'invalid_tier', message: 'Invalid tier: invalid_tier' });
+    });
+  });
+
+  describe('change_plan', () => {
+    it('should change plan successfully', async () => {
+      const mockSubscription = {
+        id: 'sub_123',
+        items: {
+          data: [
+            {
+              price: {
+                lookup_key: 'price_team'
+              }
+            }
+          ]
+        },
+        current_period_start: Math.floor(Date.now() / 1000),
+        latest_invoice: {
+          amount_due: -500 // $5 credit
+        }
+      };
+      mockStripe.subscriptions.update.mockResolvedValue(mockSubscription);
+      
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn(),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      mockPool.connect.mockResolvedValue({
+        query: jest.fn().mockImplementation((text, params) => {
+          if (text.includes('SELECT stripe_subscription_id, tier FROM subscriptions')) {
+            return Promise.resolve({ rows: [{ stripe_subscription_id: 'sub_123', tier: 'price_solo' }], rowCount: 1 });
+          }
+          if (text.includes('UPDATE subscriptions SET tier')) {
+            return Promise.resolve({});
+          }
+          if (text.includes('INSERT INTO audit_log')) {
+            return Promise.resolve({});
+          }
+          return Promise.resolve({});
+        }),
+        release: jest.fn(),
+        rollback: jest.fn(),
+        commit: jest.fn()
+      });
+
+      const result = await change_plan('sub_123', 'price_team');
+      expect(result).toEqual({
+        success: true,
+        subscription_id: 'sub_123',
+        old_tier: 'price_solo',
+        new_tier: 'price_team',
+        effective_date: expect.any(String),
+        proration_credit: 5 // $5 credit
+      });
+      expect(mockStripe.subscriptions.update).toHaveBeenCalledWith('sub_123', {
+        items: [{ price: 'price_team' }],
+        proration_behavior: 'create_prorations',
+        expand: ['latest_invoice']
+      });
+    });
+
+    it('should return invalid_tier error for invalid new tier', async () => {
+      const result = await change_plan('sub_123', 'invalid_tier');
+      expect(result).toEqual({ error: 'invalid_tier', message: 'Invalid tier: invalid_tier' });
+    });
+
+    it('should return subscription_not_found error', async () => {
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await change_plan('sub_999', 'price_team');
+      expect(result).toEqual({ error: 'subscription_not_found', message: 'Subscription not found: sub_999' });
+    });
+  });
+
+  describe('queue_refund', () => {
+    it('should queue refund successfully', async () => {
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockImplementation((text, params) => {
+            if (text.includes('SELECT id, amount, status FROM invoices')) {
+              return Promise.resolve({ rows: [{ id: 1, amount: 1000, status: 'succeeded' }], rowCount: 1 });
+            }
+            if (text.includes('INSERT INTO refunds')) {
+              return Promise.resolve({ rows: [{ id: 101 }] });
+            }
+            if (text.includes('INSERT INTO audit_log')) {
+              return Promise.resolve({});
+            }
+            return Promise.resolve({});
+          }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await queue_refund('in_123', 500, 'Customer requested', 'admin');
+      expect(result).toEqual({
+        success: true,
+        refund_id: 101,
+        status: 'queued',
+        amount: 500,
+        reason: 'Customer requested'
+      });
+      expect(mockPool.query).toHaveBeenCalledWith(
+        `INSERT INTO refunds (invoice_id, amount, status, reason, created_by)
+         VALUES ($1, $2, 'queued', $3, $4)
+         RETURNING id`,
+        [1, 500, 'Customer requested', 'admin']
+      );
+    });
+
+    it('should return refund_exceeds_invoice error', async () => {
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [{ id: 1, amount: 300, status: 'succeeded' }], rowCount: 1 }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await queue_refund('in_123', 500, 'Customer requested', 'admin');
+      expect(result).toEqual({ error: 'refund_exceeds_invoice', message: 'Refund amount 500 exceeds invoice amount 300' });
+    });
+
+    it('should return invoice_not_succeeded error', async () => {
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockResolvedValue({ rows: [{ id: 1, amount: 500, status: 'open' }], rowCount: 1 }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await queue_refund('in_123', 500, 'Customer requested', 'admin');
+      expect(result).toEqual({ error: 'invoice_not_succeeded', message: 'Invoice status is open, expected succeeded' });
+    });
+  });
+
+  describe('handle_stripe_webhook', () => {
+    it('should handle invoice.payment_succeeded', async () => {
+      const mockEvent = {
+        id: 'evt_123',
+        type: 'invoice.payment_succeeded',
+        data: {
+          object: {
+            id: 'in_123',
+            customer: 'cus_123',
+            amount_paid: 1000
+          }
+        }
+      };
+      
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockImplementation((text, params) => {
+            if (text.includes('SELECT id FROM events WHERE stripe_event_id = $1')) {
+              return Promise.resolve({ rows: [], rowCount: 0 });
+            }
+            if (text.includes('INSERT INTO invoices')) {
+              return Promise.resolve({});
+            }
+            if (text.includes('INSERT INTO audit_log')) {
+              return Promise.resolve({});
+            }
+            if (text.includes('INSERT INTO events')) {
+              return Promise.resolve({});
+            }
+            return Promise.resolve({});
+          }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await handle_stripe_webhook(mockEvent);
+      expect(result).toEqual({ received: true });
+      expect(mockPool.query).toHaveBeenCalledWith(
+        `INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at)
+         VALUES ($1, $2, $3, 'succeeded', NOW())
+         ON CONFLICT (stripe_invoice_id) DO UPDATE SET
+           status = EXCLUDED.status,
+           paid_at = EXCLUDED.paid_at`,
+        ['in_123', 'cus_123', 1000]
+      );
+    });
+
+    it('should handle duplicate event (idempotency)', async () => {
+      const mockEvent = {
+        id: 'evt_123',
+        type: 'invoice.payment_succeeded',
+        data: {
+          object: {
+            id: 'in_123',
+            customer: 'cus_123',
+            amount_paid: 1000
+          }
+        }
+      };
+      
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockImplementation((text, params) => {
+            if (text.includes('SELECT id FROM events WHERE stripe_event_id = $1')) {
+              return Promise.resolve({ rows: [{ id: 1 }], rowCount: 1 });
+            }
+            return Promise.resolve({});
+          }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await handle_stripe_webhook(mockEvent);
+      expect(result).toEqual({ received: true });
+      // Should not process the event again
+      expect(mockPool.query).not.toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO invoices'),
+        expect.any(Array)
+      );
+    });
+
+    it('should handle customer.subscription.updated', async () => {
+      const mockEvent = {
+        id: 'evt_123',
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: 'sub_123',
+            customer: 'cus_123',
+            items: {
+              data: [
+                {
+                  price: {
+                    lookup_key: 'price_team'
+                  }
+                }
+              ]
+            },
+            status: 'active'
+          }
+        }
+      };
+      
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockImplementation((text, params) => {
+            if (text.includes('SELECT id FROM events WHERE stripe_event_id = $1')) {
+              return Promise.resolve({ rows: [], rowCount: 0 });
+            }
+            if (text.includes('UPDATE subscriptions SET tier')) {
+              return Promise.resolve({});
+            }
+            if (text.includes('INSERT INTO audit_log')) {
+              return Promise.resolve({});
+            }
+            if (text.includes('SELECT tier FROM subscriptions')) {
+              return Promise.resolve({ rows: [{ tier: 'price_solo' }] });
+            }
+            if (text.includes('INSERT INTO events')) {
+              return Promise.resolve({});
+            }
+            return Promise.resolve({});
+          }),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await handle_stripe_webhook(mockEvent);
+      expect(result).toEqual({ received: true });
+      expect(mockPool.query).toHaveBeenCalledWith(
+        `UPDATE subscriptions SET 
+         tier = $1, 
+         status = $2, 
+         updated_at = NOW() 
+         WHERE stripe_subscription_id = $3`,
+        ['price_team', 'active', 'sub_123']
+      );
+    });
+
+    it('should return error on database failure', async () => {
+      const mockEvent = {
+        id: 'evt_123',
+        type: 'invoice.payment_succeeded',
+        data: {
+          object: {
+            id: 'in_123',
+            customer: 'cus_123',
+            amount_paid: 1000
+          }
+        }
+      };
+      
+      const mockPool = {
+        query: jest.fn(),
+        connect: jest.fn().mockResolvedValue({
+          query: jest.fn().mockRejectedValue(new Error('DB error')),
+          release: jest.fn(),
+          rollback: jest.fn(),
+          commit: jest.fn()
+        })
+      };
+      // @ts-ignore
+      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      
+      const result = await handle_stripe_webhook(mockEvent);
+      expect(result).toEqual({ error: 'webhook_processing_error', message: 'DB error' });
+    });
+  });
+});

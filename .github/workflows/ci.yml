@@ -1,0 +1,72 @@
+# Runs every system's tests for each language (tools/run_suites.py).
+# The run fails only on a REGRESSION: a suite that is not listed in ci/baseline.json and does not pass.
+# Known-failing suites are listed there so main is not permanently red; fix one, then delete its line.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suites:
+    name: ${{ matrix.lang }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [csharp, go, java, javascript, php, python, rust, typescript]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@v4
+        if: matrix.lang == 'javascript' || matrix.lang == 'typescript'
+        with: {node-version: "22"}
+      - uses: actions/setup-go@v5
+        if: matrix.lang == 'go'
+        with: {go-version: stable}
+      - uses: actions/setup-java@v4
+        if: matrix.lang == 'java'
+        with: {distribution: temurin, java-version: "21"}
+      - uses: shivammathur/setup-php@v2
+        if: matrix.lang == 'php'
+        with:
+          php-version: "8.3"
+          extensions: pdo_sqlite, sqlite3, mbstring
+          tools: composer
+      - uses: actions/setup-dotnet@v4
+        if: matrix.lang == 'csharp'
+        with: {dotnet-version: "8.0.x"}
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.lang == 'rust'
+
+      # Third-party packages are downloaded into .deps/ and cached per language.
+      - uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-${{ matrix.lang }}-${{ hashFiles('tools/run_suites.py') }}
+
+      - name: Run suites
+        run: >
+          python tools/run_suites.py --lang ${{ matrix.lang }}
+          --baseline ci/baseline.json
+          --json results-${{ matrix.lang }}.json
+          --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload per-suite results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.lang }}
+          path: results-${{ matrix.lang }}.json
+          if-no-files-found: ignore

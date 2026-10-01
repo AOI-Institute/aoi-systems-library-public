@@ -1,0 +1,56 @@
+# Local test-runner state (tools/run_suites.py installs dependencies here)
+.deps/
+.scratch/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# JavaScript / TypeScript
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Go
+*.test
+*.out
+go.work
+
+# Rust
+target/
+Cargo.lock
+
+# Java
+*.class
+*.jar
+out/
+.gradle/
+build/
+
+# C# / .NET
+bin/
+obj/
+*.user
+.vs/
+
+# PHP
+vendor/
+composer.lock
+.phpunit.result.cache
+
+# Secrets: never commit these
+.env
+.env.*
+*.pem
+*.key

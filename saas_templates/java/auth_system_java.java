@@ -1,0 +1,743 @@
+import java.sql.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+import java.security.SecureRandom;
+import java.nio.charset.StandardCharsets;
+
+import com.auth0.jwt.JWT;
+import com.auth0.jwt.algorithms.Algorithm;
+import com.auth0.jwt.interfaces.DecodedJWT;
+import org.mindrot.jbcrypt.BCrypt;
+import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.type.TypeReference;
+
+/**
+ * Auth System Implementation
+ */
+public class AuthSystem {
+
+    /* ---------- Database ---------- */
+    private static final String DB_URL = "jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1";
+    private static final Connection conn;
+
+    static {
+        try {
+            conn = DriverManager.getConnection(DB_URL);
+            runMigrations();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void runMigrations() throws SQLException {
+        String users = "CREATE TABLE IF NOT EXISTS users (" +
+                "id IDENTITY PRIMARY KEY, email VARCHAR(255) UNIQUE, password_hash VARCHAR(255), " +
+                "tier VARCHAR(50) DEFAULT 'basic', status VARCHAR(20), email_verified_at TIMESTAMP, " +
+                "mfa_secret VARCHAR(255), mfa_enabled BOOLEAN DEFAULT FALSE, name VARCHAR(255))";
+        String sessions = "CREATE TABLE IF NOT EXISTS sessions (" +
+                "id IDENTITY PRIMARY KEY, user_id BIGINT, refresh_token VARCHAR(255), " +
+                "created_at TIMESTAMP, expires_at TIMESTAMP, ip VARCHAR(45), device_id VARCHAR(255))";
+        String audit = "CREATE TABLE IF NOT EXISTS audit_log (" +
+                "timestamp TIMESTAMP, actor_id BIGINT, action VARCHAR(255), resource_type VARCHAR(50), " +
+                "resource_id BIGINT, old_value VARCHAR(255), new_value VARCHAR(255))";
+        String verCodes = "CREATE TABLE IF NOT EXISTS verification_codes (" +
+                "id IDENTITY PRIMARY KEY, user_id BIGINT, code VARCHAR(255), created_at TIMESTAMP, " +
+                "expires_at TIMESTAMP, type VARCHAR(10))";
+        String oauthLinks = "CREATE TABLE IF NOT EXISTS oauth_links (" +
+                "id IDENTITY PRIMARY KEY, user_id BIGINT, provider VARCHAR(50), provider_user_id VARCHAR(255))";
+
+        try (Statement st = conn.createStatement()) {
+            st.execute(users);
+            st.execute(sessions);
+            st.execute(audit);
+            st.execute(verCodes);
+            st.execute(oauthLinks);
+        }
+    }
+
+    /* ---------- Utilities ---------- */
+    private static final SecureRandom random = new SecureRandom();
+    private static final DateTimeFormatter iso = DateTimeFormatter.ISO_INSTANT;
+    private static final ObjectMapper mapper = new ObjectMapper();
+    private static final Algorithm jwtAlg = Algorithm.HMAC256("secret");
+    private static final TimeBasedOneTimePasswordGenerator totpGen =
+            new TimeBasedOneTimePasswordGenerator(30, 6, java.security.MessageDigest.getInstance("SHA-1"));
+
+    private static final Set<String> commonPasswords = Set.of(
+            "123456", "password", "12345678", "qwerty", "123456789", "12345", "1234", "111111", "1234567"
+    );
+
+    /* ---------- Rate Limiter ---------- */
+    private static final ConcurrentHashMap<String, List<Instant>> signupAttempts = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, List<Instant>> loginAttempts = new ConcurrentHashMap<>();
+
+    private static void recordAttempt(ConcurrentHashMap<String, List<Instant>> map, String key, Duration window) {
+        Instant now = Instant.now();
+        map.compute(key, (k, list) -> {
+            if (list == null) list = new ArrayList<>();
+            list.removeIf(t -> t.isBefore(now.minus(window)));
+            list.add(now);
+            return list;
+        });
+    }
+
+    private static boolean isRateLimited(ConcurrentHashMap<String, List<Instant>> map, String key, int max, Duration window) {
+        List<Instant> list = map.getOrDefault(key, List.of());
+        return list.size() >= max;
+    }
+
+    /* ---------- Auth Service ---------- */
+    public static Map<String, Object> signup(String email, String password, String name, String ip) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            // Rate limit
+            if (isRateLimited(signupAttempts, ip, 5, Duration.ofHours(24))) {
+                decisions.add("rate_limit_ip_24h");
+                return error("too_many_signups_from_ip", "Rate limit exceeded");
+            }
+            recordAttempt(signupAttempts, ip, Duration.ofHours(24));
+
+            // Email unique
+            if (userExists(email)) {
+                decisions.add("email_unique");
+                return error("email_already_exists", "Email already registered");
+            }
+
+            // Password strength
+            String pwReason = passwordStrengthCheck(password, email, name);
+            if (pwReason != null) {
+                decisions.add("password_strength");
+                return error("password_too_weak", pwReason);
+            }
+
+            // Create user
+            String hash = BCrypt.hashpw(password, BCrypt.gensalt());
+            long userId = insertUser(email, hash, name);
+            decisions.add("user_created");
+
+            // Send verification email
+            String code = generateCode();
+            insertVerificationCode(userId, code, "email");
+            sendEmail(email, code);
+
+            logWhy("signup", decisions);
+            auditLog(userId, "user_created", "users", userId, null, null);
+            return success(Map.of(
+                    "status", "pending_verification",
+                    "email", email,
+                    "message", "check email"
+            ));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    public static Map<String, Object> verifyEmail(String email, String code) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            Long userId = getUserIdByEmail(email);
+            if (userId == null) return error("invalid_email", "Email not found");
+            decisions.add("user_exists");
+
+            VerificationCode vc = getVerificationCode(userId, code, "email");
+            if (vc == null) {
+                decisions.add("code_invalid");
+                return error("code_invalid", "Invalid or expired code");
+            }
+            decisions.add("code_valid");
+
+            // Mark verified
+            updateEmailVerifiedAt(userId);
+            deleteVerificationCode(vc.id);
+            decisions.add("email_verified");
+
+            logWhy("verify_email", decisions);
+            auditLog(userId, "email_verified", "users", userId, null, null);
+            return success(Map.of(
+                    "status", "verified",
+                    "user_id", userId,
+                    "message", "ready to login"
+            ));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    public static Map<String, Object> login(String email, String password, String deviceId, String ip) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            Long userId = getUserIdByEmail(email);
+            if (userId == null) {
+                decisions.add("user_exists");
+                return error("invalid_credentials", "Invalid credentials");
+            }
+            decisions.add("user_exists");
+
+            if (!isEmailVerified(userId)) {
+                decisions.add("user_verified");
+                return error("email_not_verified", "Email not verified");
+            }
+
+            if (!checkPassword(userId, password)) {
+                decisions.add("password_correct");
+                recordAttempt(loginAttempts, ip + ":" + userId, Duration.ofMinutes(15));
+                if (isRateLimited(loginAttempts, ip + ":" + userId, 5, Duration.ofMinutes(15))) {
+                    decisions.add("rate_limit");
+                    return error("too_many_attempts", "Too many failed attempts");
+                }
+                return error("invalid_credentials", "Invalid credentials");
+            }
+            decisions.add("password_correct");
+
+            // MFA check
+            if (isMfaEnabled(userId)) {
+                decisions.add("mfa_gate");
+                String challengeId = generateCode();
+                insertVerificationCode(userId, challengeId, "mfa");
+                return success(Map.of(
+                        "status", "mfa_required",
+                        "challenge_id", challengeId
+                ));
+            }
+
+            // Create session
+            String sessionId = UUID.randomUUID().toString();
+            String refreshToken = UUID.randomUUID().toString();
+            Instant now = Instant.now();
+            Instant exp = now.plus(Duration.ofHours(1));
+            insertSession(sessionId, userId, refreshToken, now, exp, ip, deviceId);
+            decisions.add("session_created");
+
+            String token = JWT.create()
+                    .withClaim("user_id", userId)
+                    .withClaim("tier", getTier(userId))
+                    .withExpiresAt(Date.from(exp))
+                    .sign(jwtAlg);
+
+            logWhy("login", decisions);
+            auditLog(userId, "session_created", "sessions", sessionId, null, null);
+            return success(Map.of(
+                    "status", "authenticated",
+                    "session_id", sessionId,
+                    "token", token,
+                    "expires_in", exp.getEpochSecond() - now.getEpochSecond(),
+                    "user", Map.of(
+                            "id", userId,
+                            "email", email,
+                            "tier", getTier(userId)
+                    )
+            ));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    public static Map<String, Object> oauthCallback(String provider, String code, String state) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            // Validate state (simplified)
+            if (state == null || state.isEmpty()) {
+                decisions.add("state_valid");
+                return error("invalid_state", "State invalid");
+            }
+            decisions.add("state_valid");
+
+            // Simulate provider email extraction
+            String email = OAuthProviderRegistry.get(provider).getEmail(code);
+            if (email == null) {
+                decisions.add("email_verified");
+                return error("email_not_verified", "Provider email not verified");
+            }
+            decisions.add("email_verified");
+
+            Long userId = getUserIdByEmail(email);
+            if (userId == null) {
+                // New user
+                String hash = BCrypt.hashpw(generateRandomPassword(), BCrypt.gensalt());
+                userId = insertUser(email, hash, null);
+                decisions.add("user_created");
+                // Mark verified
+                updateEmailVerifiedAt(userId);
+            } else {
+                decisions.add("user_exists");
+            }
+
+            // Link provider
+            linkOAuth(userId, provider, code);
+            decisions.add("oauth_linked");
+
+            // Create session
+            String sessionId = UUID.randomUUID().toString();
+            String refreshToken = UUID.randomUUID().toString();
+            Instant now = Instant.now();
+            Instant exp = now.plus(Duration.ofHours(1));
+            insertSession(sessionId, userId, refreshToken, now, exp, null, null);
+            decisions.add("session_created");
+
+            String token = JWT.create()
+                    .withClaim("user_id", userId)
+                    .withClaim("tier", getTier(userId))
+                    .withExpiresAt(Date.from(exp))
+                    .sign(jwtAlg);
+
+            logWhy("oauth_callback", decisions);
+            auditLog(userId, "oauth_login", "sessions", sessionId, null, null);
+            return success(Map.of(
+                    "status", "authenticated",
+                    "session_id", sessionId,
+                    "token", token,
+                    "user", Map.of(
+                            "id", userId,
+                            "email", email,
+                            "tier", getTier(userId)
+                    )
+            ));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    public static Map<String, Object> mfaChallenge(String challengeId, String code) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            VerificationCode vc = getVerificationCodeById(challengeId, "mfa");
+            if (vc == null) {
+                decisions.add("challenge_valid");
+                return error("invalid_code", "Challenge not found or expired");
+            }
+            decisions.add("challenge_valid");
+
+            Long userId = vc.userId;
+            String secret = getMfaSecret(userId);
+            if (secret == null) {
+                decisions.add("code_correct");
+                return error("invalid_code", "MFA not enabled");
+            }
+
+            if (!verifyTotp(secret, code)) {
+                decisions.add("code_correct");
+                return error("invalid_code", "Invalid MFA code");
+            }
+            decisions.add("code_correct");
+
+            // Mark challenge verified
+            deleteVerificationCode(vc.id);
+            decisions.add("challenge_verified");
+
+            // Create session
+            String sessionId = UUID.randomUUID().toString();
+            String refreshToken = UUID.randomUUID().toString();
+            Instant now = Instant.now();
+            Instant exp = now.plus(Duration.ofHours(1));
+            insertSession(sessionId, userId, refreshToken, now, exp, null, null);
+            decisions.add("session_created");
+
+            String token = JWT.create()
+                    .withClaim("user_id", userId)
+                    .withClaim("tier", getTier(userId))
+                    .withExpiresAt(Date.from(exp))
+                    .sign(jwtAlg);
+
+            logWhy("mfa_challenge", decisions);
+            auditLog(userId, "mfa_verified", "sessions", sessionId, null, null);
+            return success(Map.of(
+                    "status", "authenticated",
+                    "session_id", sessionId,
+                    "token", token,
+                    "user", Map.of(
+                            "id", userId,
+                            "email", getEmail(userId),
+                            "tier", getTier(userId)
+                    )
+            ));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    public static Map<String, Object> tokenRefresh(String refreshToken) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            Session session = getSessionByRefreshToken(refreshToken);
+            if (session == null) {
+                decisions.add("token_valid");
+                return error("invalid_token", "Refresh token invalid");
+            }
+            decisions.add("token_valid");
+
+            if (Instant.now().isAfter(session.expiresAt)) {
+                decisions.add("token_expired");
+                return error("token_expired", "Refresh token expired");
+            }
+
+            Long userId = session.userId;
+            if (isUserBanned(userId)) {
+                decisions.add("user_active");
+                return error("user_banned", "User is banned");
+            }
+            decisions.add("user_active");
+
+            // Issue new token
+            String token = JWT.create()
+                    .withClaim("user_id", userId)
+                    .withClaim("tier", getTier(userId))
+                    .withExpiresAt(Date.from(Instant.now().plus(Duration.ofHours(1))))
+                    .sign(jwtAlg);
+
+            decisions.add("token_issued");
+            logWhy("token_refresh", decisions);
+            auditLog(userId, "token_refreshed", "sessions", session.id, null, null);
+            return success(Map.of(
+                    "status", "ok",
+                    "token", token,
+                    "expires_in", 3600
+            ));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    /* ---------- Helper Methods ---------- */
+    private static boolean userExists(String email) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT id FROM users WHERE email = ?")) {
+            ps.setString(1, email);
+            ResultSet rs = ps.executeQuery();
+            return rs.next();
+        }
+    }
+
+    private static long insertUser(String email, String hash, String name) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO users (email, password_hash, tier, status, name) VALUES (?, ?, 'basic', 'unverified', ?)",
+                Statement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, email);
+            ps.setString(2, hash);
+            ps.setString(3, name);
+            ps.executeUpdate();
+            ResultSet rs = ps.getGeneratedKeys();
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    private static Long getUserIdByEmail(String email) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT id FROM users WHERE email = ?")) {
+            ps.setString(1, email);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getLong(1);
+            return null;
+        }
+    }
+
+    private static String getEmail(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT email FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getString(1);
+            return null;
+        }
+    }
+
+    private static String getTier(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT tier FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getString(1);
+            return "basic";
+        }
+    }
+
+    private static boolean isEmailVerified(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT email_verified_at FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getTimestamp(1) != null;
+            return false;
+        }
+    }
+
+    private static void updateEmailVerifiedAt(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("UPDATE users SET email_verified_at = ? WHERE id = ?")) {
+            ps.setTimestamp(1, Timestamp.from(Instant.now()));
+            ps.setLong(2, userId);
+            ps.executeUpdate();
+        }
+    }
+
+    private static boolean checkPassword(long userId, String password) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT password_hash FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                String hash = rs.getString(1);
+                return BCrypt.checkpw(password, hash);
+            }
+            return false;
+        }
+    }
+
+    private static boolean isMfaEnabled(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT mfa_enabled FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getBoolean(1);
+            return false;
+        }
+    }
+
+    private static String getMfaSecret(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT mfa_secret FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getString(1);
+            return null;
+        }
+    }
+
+    private static boolean verifyTotp(String secret, String code) throws Exception {
+        byte[] key = Base64.getDecoder().decode(secret);
+        Instant now = Instant.now();
+        int totp = totpGen.generateOneTimePassword(key, now);
+        return String.format("%06d", totp).equals(code);
+    }
+
+    private static void insertSession(String sessionId, long userId, String refreshToken,
+                                      Instant createdAt, Instant expiresAt, String ip, String deviceId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO sessions (id, user_id, refresh_token, created_at, expires_at, ip, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+            ps.setString(1, sessionId);
+            ps.setLong(2, userId);
+            ps.setString(3, refreshToken);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
+            ps.setTimestamp(5, Timestamp.from(expiresAt));
+            ps.setString(6, ip);
+            ps.setString(7, deviceId);
+            ps.executeUpdate();
+        }
+    }
+
+    private static Session getSessionByRefreshToken(String refreshToken) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id, user_id, created_at, expires_at, ip, device_id FROM sessions WHERE refresh_token = ?")) {
+            ps.setString(1, refreshToken);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return new Session(
+                        rs.getString(1),
+                        rs.getLong(2),
+                        rs.getTimestamp(3).toInstant(),
+                        rs.getTimestamp(4).toInstant(),
+                        rs.getString(5),
+                        rs.getString(6)
+                );
+            }
+            return null;
+        }
+    }
+
+    private static boolean isUserBanned(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM users WHERE id = ?")) {
+            ps.setLong(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                String status = rs.getString(1);
+                return status.equals("suspended") || status.equals("banned");
+            }
+            return false;
+        }
+    }
+
+    private static void linkOAuth(long userId, String provider, String providerUserId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO oauth_links (user_id, provider, provider_user_id) VALUES (?, ?, ?)")) {
+            ps.setLong(1, userId);
+            ps.setString(2, provider);
+            ps.setString(3, providerUserId);
+            ps.executeUpdate();
+        }
+    }
+
+    private static String generateCode() {
+        byte[] bytes = new byte[16];
+        random.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    private static void insertVerificationCode(long userId, String code, String type) throws SQLException {
+        Instant now = Instant.now();
+        Instant exp = now.plus(Duration.ofHours(24));
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)")) {
+            ps.setLong(1, userId);
+            ps.setString(2, code);
+            ps.setTimestamp(3, Timestamp.from(now));
+            ps.setTimestamp(4, Timestamp.from(exp));
+            ps.setString(5, type);
+            ps.executeUpdate();
+        }
+    }
+
+    private static VerificationCode getVerificationCode(long userId, String code, String type) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code = ? AND type = ?")) {
+            ps.setLong(1, userId);
+            ps.setString(2, code);
+            ps.setString(3, type);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                VerificationCode vc = new VerificationCode(
+                        rs.getLong(1),
+                        rs.getLong(2),
+                        rs.getString(3),
+                        rs.getTimestamp(4).toInstant(),
+                        rs.getTimestamp(5).toInstant(),
+                        rs.getString(6)
+                );
+                if (Instant.now().isAfter(vc.expiresAt)) return null;
+                return vc;
+            }
+            return null;
+        }
+    }
+
+    private static VerificationCode getVerificationCodeById(String id, String type) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE id = ? AND type = ?")) {
+            ps.setString(1, id);
+            ps.setString(2, type);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                VerificationCode vc = new VerificationCode(
+                        rs.getLong(1),
+                        rs.getLong(2),
+                        rs.getString(3),
+                        rs.getTimestamp(4).toInstant(),
+                        rs.getTimestamp(5).toInstant(),
+                        rs.getString(6)
+                );
+                if (Instant.now().isAfter(vc.expiresAt)) return null;
+                return vc;
+            }
+            return null;
+        }
+    }
+
+    private static void deleteVerificationCode(long id) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM verification_codes WHERE id = ?")) {
+            ps.setLong(1, id);
+            ps.executeUpdate();
+        }
+    }
+
+    private static String passwordStrengthCheck(String password, String email, String name) {
+        if (password.length() < 15) return "too_short";
+        if (password.length() > 64) return "too_long";
+        if (!password.chars().allMatch(c -> Character.isISOControl(c) == false)) return "invalid_chars";
+        if (commonPasswords.contains(password.toLowerCase())) return "blocklisted";
+        if (password.equalsIgnoreCase(email) || password.equalsIgnoreCase(name) || password.equalsIgnoreCase("auth_system"))
+            return "blocklisted";
+        return null;
+    }
+
+    private static void sendEmail(String email, String code) {
+        // Simulated email send
+        System.out.println("Sending email to " + email + " with code " + code);
+    }
+
+    private static void logWhy(String flow, List<String> decisions) {
+        System.out.println("why_chain(flow=\"" + flow + "\", decision_points=" + decisions + ")");
+    }
+
+    private static void auditLog(Long actorId, String action, String resourceType, Long resourceId,
+                                 String oldValue, String newValue) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+            ps.setTimestamp(1, Timestamp.from(Instant.now()));
+            ps.setObject(2, actorId);
+            ps.setString(3, action);
+            ps.setString(4, resourceType);
+            ps.setObject(5, resourceId);
+            ps.setString(6, oldValue);
+            ps.setString(7, newValue);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static Map<String, Object> success(Map<String, Object> data) {
+        Map<String, Object> res = new HashMap<>();
+        res.put("success", true);
+        res.putAll(data);
+        return res;
+    }
+
+    private static Map<String, Object> error(String code, String message) {
+        Map<String, Object> res = new HashMap<>();
+        res.put("success", false);
+        res.put("error", code);
+        res.put("message", message);
+        return res;
+    }
+
+    private static String generateRandomPassword() {
+        return "P@ssw0rd" + random.nextInt(1000);
+    }
+
+    /* ---------- Inner Classes ---------- */
+    private static class VerificationCode {
+        long id;
+        long userId;
+        String code;
+        Instant createdAt;
+        Instant expiresAt;
+        String type;
+        VerificationCode(long id, long userId, String code, Instant createdAt, Instant expiresAt, String type) {
+            this.id = id; this.userId = userId; this.code = code; this.createdAt = createdAt; this.expiresAt = expiresAt; this.type = type;
+        }
+    }
+
+    private static class Session {
+        String id;
+        long userId;
+        Instant createdAt;
+        Instant expiresAt;
+        String ip;
+        String deviceId;
+        Session(String id, long userId, Instant createdAt, Instant expiresAt, String ip, String deviceId) {
+            this.id = id; this.userId = userId; this.createdAt = createdAt; this.expiresAt = expiresAt; this.ip = ip; this.deviceId = deviceId;
+        }
+    }
+
+    /* ---------- OAuth Provider Registry ---------- */
+    public interface OAuthProvider {
+        String getEmail(String code);
+    }
+
+    public static class DummyOAuthProvider implements OAuthProvider {
+        private final String email;
+        DummyOAuthProvider(String email) { this.email = email; }
+        public String getEmail(String code) { return email; }
+    }
+
+    public static class OAuthProviderRegistry {
+        private static final Map<String, OAuthProvider> providers = new HashMap<>();
+        public static void register(String name, OAuthProvider provider) { providers.put(name, provider); }
+        public static OAuthProvider get(String name) { return providers.get(name); }
+    }
+
+    /* ---------- Main for demonstration (optional) ---------- */
+    public static void main(String[] args) throws Exception {
+        OAuthProviderRegistry.register("google", new DummyOAuthProvider("user@example.com"));
+        System.out.println(mapToJson(signup("user@example.com", "StrongPassword123456", "Alice", "127.0.0.1")));
+        // Further demo omitted
+    }
+
+    private static String mapToJson(Map<String, Object> map) throws Exception {
+        return mapper.writeValueAsString(map);
+    }
+}

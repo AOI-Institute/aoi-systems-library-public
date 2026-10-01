@@ -1,0 +1,11 @@
+name: New system or feature
+description: Propose a new system, a new language, or a feature for an existing one
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes: {label: "What do you want to add?", description: "A new SaaS building block, a new language, or a feature in an existing system."}
+    validations: {required: true}
+  - type: textarea
+    id: contract
+    attributes: {label: Contract, description: "Behaviour and tests it should have, so all languages can match."}

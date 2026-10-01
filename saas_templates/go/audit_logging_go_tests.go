@@ -1,0 +1,508 @@
+package auditlogging
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+)
+
+func TestAuditLogger_HappyPath(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	req := LogMutationRequest{
+		ActorID:      strPtr("123"),
+		ActorType:    "user",
+		Action:       "subscription_changed",
+		ResourceType: "subscription",
+		ResourceID:   "456",
+		OldValue:     json.RawMessage(`{"tier": "team", "billing_date": "2026-10-15"}`),
+		NewValue:     json.RawMessage(`{"tier": "enterprise", "billing_date": "2026-10-15"}`),
+		WhyChainID:   strPtr("wc_789"),
+	}
+
+	logID, err := logger.LogMutation(ctx, req)
+	if err != nil {
+		t.Fatalf("LogMutation failed: %v", err)
+	}
+	if logID == "" {
+		t.Fatal("expected non-empty log ID")
+	}
+
+	queryReq := QueryLogsRequest{
+		ActorID:      strPtr("123"),
+		ResourceType: strPtr("subscription"),
+		Limit:        10,
+		Offset:       0,
+	}
+	resp, err := logger.QueryLogs(ctx, queryReq)
+	if err != nil {
+		t.Fatalf("QueryLogs failed: %v", err)
+	}
+
+	if resp.Total != 1 {
+		t.Errorf("expected total=1, got %d", resp.Total)
+	}
+	if len(resp.Logs) != 1 {
+		t.Errorf("expected 1 log, got %d", len(resp.Logs))
+	}
+	if resp.Logs[0].ID != logID {
+		t.Errorf("log ID mismatch: got %s, want %s", resp.Logs[0].ID, logID)
+	}
+	if resp.Logs[0].Action != "subscription_changed" {
+		t.Errorf("action mismatch: got %s", resp.Logs[0].Action)
+	}
+	if !resp.Logs[0].ActorID.Valid() || *resp.Logs[0].ActorID != "123" {
+		t.Errorf("actor_id mismatch: got %v", resp.Logs[0].ActorID)
+	}
+}
+
+func TestAuditLogger_Replay_DivergenceDetection(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	req1 := LogMutationRequest{
+		ActorID:      strPtr("123"),
+		ActorType:    "user",
+		Action:       "user_created",
+		ResourceType: "user",
+		ResourceID:   "user_001",
+		OldValue:     json.RawMessage(`null`),
+		NewValue:     json.RawMessage(`{"name": "Alice", "email": "alice@example.com"}`),
+	}
+	logID1, err := logger.LogMutation(ctx, req1)
+	if err != nil {
+		t.Fatalf("LogMutation 1 failed: %v", err)
+	}
+
+	req2 := LogMutationRequest{
+		ActorID:      strPtr("123"),
+		ActorType:    "user",
+		Action:       "user_updated",
+		ResourceType: "user",
+		ResourceID:   "user_001",
+		OldValue:     json.RawMessage(`{"name": "Alice", "email": "alice@example.com"}`),
+		NewValue:     json.RawMessage(`{"name": "Alice Smith", "email": "alice@example.com"}`),
+	}
+	_, err = logger.LogMutation(ctx, req2)
+	if err != nil {
+		t.Fatalf("LogMutation 2 failed: %v", err)
+	}
+
+	replay1, err := logger.Replay(ctx, logID1)
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+
+	if !replay1.HasDiverged {
+		t.Error("expected HasDiverged=true for log with later mutations")
+	}
+	if replay1.LogID != logID1 {
+		t.Errorf("replay log ID mismatch: got %s", replay1.LogID)
+	}
+
+	var state map[string]any
+	json.Unmarshal(replay1.ResourceStateAtTime, &state)
+	if state["name"] != "Alice" {
+		t.Errorf("resource state at time mismatch: got %v", state)
+	}
+
+	replay2, err := logger.Replay(ctx, logID1)
+	if err != nil {
+		t.Fatalf("Replay 2 failed: %v", err)
+	}
+	if !replay2.HasDiverged {
+		t.Error("expected HasDiverged=true on second replay")
+	}
+}
+
+func TestAuditLogger_Filtering(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	logs := []LogMutationRequest{
+		{ActorID: strPtr("1"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{}`)},
+		{ActorID: strPtr("1"), ActorType: "user", Action: "user_suspended", ResourceType: "user", ResourceID: "u2", NewValue: json.RawMessage(`{}`)},
+		{ActorID: strPtr("2"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u3", NewValue: json.RawMessage(`{}`)},
+		{ActorID: strPtr("1"), ActorType: "service", Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{}`)},
+	}
+
+	for _, l := range logs {
+		_, err := logger.LogMutation(ctx, l)
+		if err != nil {
+			t.Fatalf("LogMutation failed: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		req        QueryLogsRequest
+		wantCount  int
+		wantAction string
+	}{
+		{
+			name: "filter by actor_id",
+			req:  QueryLogsRequest{ActorID: strPtr("1"), Limit: 10},
+			wantCount: 3,
+		},
+		{
+			name: "filter by action wildcard user_*",
+			req:  QueryLogsRequest{Action: strPtr("user_*"), Limit: 10},
+			wantCount: 3,
+		},
+		{
+			name: "filter by resource_type",
+			req:  QueryLogsRequest{ResourceType: strPtr("user"), Limit: 10},
+			wantCount: 3,
+		},
+		{
+			name: "combined actor_id + action + resource_type",
+			req:  QueryLogsRequest{ActorID: strPtr("1"), Action: strPtr("user_*"), ResourceType: strPtr("user"), Limit: 10},
+			wantCount: 2,
+		},
+		{
+			name: "actor_id=2 only",
+			req:  QueryLogsRequest{ActorID: strPtr("2"), Limit: 10},
+			wantCount: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := logger.QueryLogs(ctx, tc.req)
+			if err != nil {
+				t.Fatalf("QueryLogs failed: %v", err)
+			}
+			if resp.Total != tc.wantCount {
+				t.Errorf("total=%d, want %d", resp.Total, tc.wantCount)
+			}
+			if len(resp.Logs) != tc.wantCount {
+				t.Errorf("logs count=%d, want %d", len(resp.Logs), tc.wantCount)
+			}
+			if tc.wantAction != "" {
+				for _, log := range resp.Logs {
+					if log.Action != tc.wantAction {
+						t.Errorf("unexpected action %s", log.Action)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestAuditLogger_Pagination(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	for i := 0; i < 25; i++ {
+		req := LogMutationRequest{
+			ActorID:      strPtr("1"),
+			ActorType:    "user",
+			Action:       "test_action",
+			ResourceType: "resource",
+			ResourceID:   string(rune('a' + i)),
+			NewValue:     json.RawMessage(`{}`),
+		}
+		_, err := logger.LogMutation(ctx, req)
+		if err != nil {
+			t.Fatalf("LogMutation %d failed: %v", i, err)
+		}
+	}
+
+	page1, err := logger.QueryLogs(ctx, QueryLogsRequest{Limit: 10, Offset: 0})
+	if err != nil {
+		t.Fatalf("page 1 failed: %v", err)
+	}
+	if len(page1.Logs) != 10 {
+		t.Errorf("page 1: expected 10 logs, got %d", len(page1.Logs))
+	}
+	if !page1.HasMore {
+		t.Error("page 1 should have more")
+	}
+
+	page2, err := logger.QueryLogs(ctx, QueryLogsRequest{Limit: 10, Offset: 10})
+	if err != nil {
+		t.Fatalf("page 2 failed: %v", err)
+	}
+	if len(page2.Logs) != 10 {
+		t.Errorf("page 2: expected 10 logs, got %d", len(page2.Logs))
+	}
+	if !page2.HasMore {
+		t.Error("page 2 should have more")
+	}
+
+	page3, err := logger.QueryLogs(ctx, QueryLogsRequest{Limit: 10, Offset: 20})
+	if err != nil {
+		t.Fatalf("page 3 failed: %v", err)
+	}
+	if len(page3.Logs) != 5 {
+		t.Errorf("page 3: expected 5 logs, got %d", len(page3.Logs))
+	}
+	if page3.HasMore {
+		t.Error("page 3 should not have more")
+	}
+
+	if page3.Total != 25 {
+		t.Errorf("total=%d, want 25", page3.Total)
+	}
+
+	allIDs := make(map[string]bool)
+	for _, log := range page1.Logs {
+		allIDs[log.ID] = true
+	}
+	for _, log := range page2.Logs {
+		if allIDs[log.ID] {
+			t.Error("duplicate log ID across pages")
+		}
+		allIDs[log.ID] = true
+	}
+	for _, log := range page3.Logs {
+		if allIDs[log.ID] {
+			t.Error("duplicate log ID across pages")
+		}
+	}
+}
+
+func TestAuditLogger_Performance_1MLogs(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	const numLogs = 100000
+	start := time.Now()
+	for i := 0; i < numLogs; i++ {
+		req := LogMutationRequest{
+			ActorID:      strPtr("perf_user"),
+			ActorType:    "user",
+			Action:       "perf_action",
+			ResourceType: "perf_resource",
+			ResourceID:   string(rune(i % 1000)),
+			NewValue:     json.RawMessage(`{"data": "test"}`),
+		}
+		_, err := logger.LogMutation(ctx, req)
+		if err != nil {
+			t.Fatalf("LogMutation %d failed: %v", i, err)
+		}
+	}
+	insertDuration := time.Since(start)
+	t.Logf("Inserted %d logs in %v", numLogs, insertDuration)
+
+	queryStart := time.Now()
+	resp, err := logger.QueryLogs(ctx, QueryLogsRequest{
+		ActorID:      strPtr("perf_user"),
+		Action:       strPtr("perf_action"),
+		ResourceType: strPtr("perf_resource"),
+		Limit:        100,
+		Offset:       0,
+	})
+	queryDuration := time.Since(queryStart)
+
+	if err != nil {
+		t.Fatalf("QueryLogs failed: %v", err)
+	}
+	if resp.Total != numLogs {
+		t.Errorf("total=%d, want %d", resp.Total, numLogs)
+	}
+	if len(resp.Logs) != 100 {
+		t.Errorf("returned %d logs, want 100", len(resp.Logs))
+	}
+
+	t.Logf("Query took %v (limit 100)", queryDuration)
+	if queryDuration > 100*time.Millisecond {
+		t.Errorf("query took %v, expected <100ms", queryDuration)
+	}
+}
+
+func TestAuditLogger_Immutability(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	req := LogMutationRequest{
+		ActorID:      strPtr("1"),
+		ActorType:    "user",
+		Action:       "test",
+		ResourceType: "resource",
+		ResourceID:   "r1",
+		NewValue:     json.RawMessage(`{}`),
+	}
+	logID, err := logger.LogMutation(ctx, req)
+	if err != nil {
+		t.Fatalf("LogMutation failed: %v", err)
+	}
+
+	_, err = logger.db.ExecContext(ctx, "UPDATE audit_log SET action = 'hacked' WHERE id = ?", logID)
+	if err == nil {
+		t.Error("expected UPDATE to fail, but it succeeded")
+	}
+}
+
+func TestAuditLogger_WildcardAction(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	actions := []string{"user_created", "user_suspended", "user_updated", "user_deleted", "admin_action"}
+	for _, action := range actions {
+		req := LogMutationRequest{
+			ActorID:      strPtr("1"),
+			ActorType:    "user",
+			Action:       action,
+			ResourceType: "user",
+			ResourceID:   "u1",
+			NewValue:     json.RawMessage(`{}`),
+		}
+		_, err := logger.LogMutation(ctx, req)
+		if err != nil {
+			t.Fatalf("LogMutation %s failed: %v", action, err)
+		}
+	}
+
+	resp, err := logger.QueryLogs(ctx, QueryLogsRequest{
+		Action:       strPtr("user_*"),
+		ResourceType: strPtr("user"),
+		Limit:        100,
+	})
+	if err != nil {
+		t.Fatalf("QueryLogs failed: %v", err)
+	}
+
+	if resp.Total != 4 {
+		t.Errorf("wildcard user_* matched %d logs, want 4", resp.Total)
+	}
+	for _, log := range resp.Logs {
+		if !strings.HasPrefix(log.Action, "user_") {
+			t.Errorf("log action %s does not match user_*", log.Action)
+		}
+	}
+}
+
+func TestAuditLogger_Search(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	logs := []LogMutationRequest{
+		{ActorID: strPtr("1"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{"email": "alice@example.com"}`)},
+		{ActorID: strPtr("1"), ActorType: "user", Action: "user_updated", ResourceType: "user", ResourceID: "u2", NewValue: json.RawMessage(`{"email": "bob@example.com"}`)},
+		{ActorID: strPtr("2"), ActorType: "service", Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{"name": "prod"}`)},
+	}
+	for _, l := range logs {
+		_, err := logger.LogMutation(ctx, l)
+		if err != nil {
+			t.Fatalf("LogMutation failed: %v", err)
+		}
+	}
+
+	searchTests := []struct {
+		name       string
+		req        SearchRequest
+		wantCount  int
+	}{
+		{"search email", SearchRequest{Query: "alice", Limit: 10}, 1},
+		{"search wildcard", SearchRequest{Query: "exam*", Limit: 10}, 2},
+		{"search resource_type filter", SearchRequest{Query: "prod", ResourceType: strPtr("deployment"), Limit: 10}, 1},
+		{"search no results", SearchRequest{Query: "nonexistent", Limit: 10}, 0},
+	}
+
+	for _, tc := range searchTests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := logger.Search(ctx, tc.req)
+			if err != nil {
+				t.Fatalf("Search failed: %v", err)
+			}
+			if len(resp.Results) != tc.wantCount {
+				t.Errorf("got %d results, want %d", len(resp.Results), tc.wantCount)
+			}
+		})
+	}
+}
+
+func TestAuditLogger_Replay_NotFound(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	_, err = logger.Replay(ctx, "nonexistent_id")
+	if err == nil {
+		t.Error("expected error for nonexistent log")
+	}
+	if !errors.Is(err, ErrLogNotFound) {
+		t.Errorf("expected ErrLogNotFound, got %v", err)
+	}
+}
+
+func TestAuditLogger_InvalidActorType(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	req := LogMutationRequest{
+		ActorID:      strPtr("1"),
+		ActorType:    "invalid_type",
+		Action:       "test",
+		ResourceType: "resource",
+		ResourceID:   "r1",
+		NewValue:     json.RawMessage(`{}`),
+	}
+	_, err = logger.LogMutation(ctx, req)
+	if err == nil {
+		t.Error("expected error for invalid actor_type")
+	}
+	if !errors.Is(err, ErrInvalidActorType) {
+		t.Errorf("expected ErrInvalidActorType, got %v", err)
+	}
+}
+
+func strPtr(s string) *string {
+	return &s
+}
+
+func (s *string) Valid() bool {
+	return s != nil
+}

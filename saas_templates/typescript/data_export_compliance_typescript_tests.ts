@@ -1,0 +1,275 @@
+import {
+  InMemoryDatabase,
+  MockS3Client,
+  MockEmailService,
+  ComplianceService,
+  Clock,
+  User,
+  Session,
+  ActivityLog,
+  FileMetadata,
+  Preferences,
+  Transaction,
+  ApiKey,
+} from './data_export_compliance_typescript';
+
+// Simple custom assertion framework to run tests standalone
+function assert(condition: boolean, message: string) {
+  if (!condition) {
+    throw new Error(`Assertion Failed: ${message}`);
+  }
+}
+
+function assertEquals<T>(actual: T, expected: T, message: string) {
+  if (actual !== expected) {
+    throw new Error(`Assertion Failed: ${message}\nExpected: ${expected}\nActual: ${actual}`);
+  }
+}
+
+class MockClock implements Clock {
+  private currentTime: Date;
+
+  constructor(initialTime: Date) {
+    this.currentTime = initialTime;
+  }
+
+  now(): Date {
+    return this.currentTime;
+  }
+
+  advanceDays(days: number): void {
+    this.currentTime = new Date(this.currentTime.getTime() + days * 24 * 60 * 60 * 1000);
+  }
+
+  advanceHours(hours: number): void {
+    this.currentTime = new Date(this.currentTime.getTime() + hours * 60 * 60 * 1000);
+  }
+}
+
+async function runTests() {
+  console.log('Starting Compliance & Data Export Module Tests...\n');
+
+  const db = new InMemoryDatabase();
+  const s3 = new MockS3Client();
+  const email = new MockEmailService();
+  const clock = new MockClock(new Date('2026-09-25T09:00:00Z'));
+  const service = new ComplianceService(db, s3, email, clock);
+
+  // Helper to seed a standard user and related data
+  const seedUser = () => {
+    db.clear();
+    email.clear();
+    s3.storage.clear();
+
+    const user: User = {
+      id: 'user_123',
+      email: 'alice@example.com',
+      name: 'Alice Smith',
+      created_at: new Date('2025-01-01T00:00:00Z'),
+      tier: 'premium',
+      status: 'active',
+    };
+
+    const admin: User = {
+      id: 'admin_999',
+      email: 'admin@example.com',
+      name: 'System Admin',
+      created_at: new Date('2024-01-01T00:00:00Z'),
+      tier: 'admin',
+      status: 'active',
+    };
+
+    const session: Session = {
+      id: 'sess_1',
+      user_id: 'user_123',
+      ip_address: '192.168.1.1',
+      device_info: 'Chrome / macOS',
+      created_at: new Date('2026-09-24T10:00:00Z'),
+    };
+
+    const activity: ActivityLog = {
+      id: 'act_1',
+      user_id: 'user_123',
+      action: 'login',
+      details: 'Successful login from Chrome',
+      created_at: new Date('2026-09-24T10:00:00Z'),
+    };
+
+    const file: FileMetadata = {
+      id: 'file_1',
+      user_id: 'user_123',
+      filename: 'tax_return_2025.pdf',
+      size_bytes: 1048576,
+      created_at: new Date('2026-02-15T14:30:00Z'),
+    };
+
+    const prefs: Preferences = {
+      user_id: 'user_123',
+      notification_settings: 'email_only',
+      theme: 'dark',
+      language: 'en-US',
+    };
+
+    const tx: Transaction = {
+      id: 'tx_1',
+      user_id: 'user_123',
+      amount: 49.99,
+      currency: 'USD',
+      type: 'payment',
+      created_at: new Date('2026-09-01T12:00:00Z'),
+    };
+
+    const apiKey: ApiKey = {
+      id: 'key_1',
+      user_id: 'user_123',
+      key_hash: 'sha256_hash_value',
+      created_at: new Date('2026-05-01T08:00:00Z'),
+    };
+
+    db.users.push(user, admin);
+    db.sessions.push(session);
+    db.activityLogs.push(activity);
+    db.files.push(file);
+    db.preferences.push(prefs);
+    db.transactions.push(tx);
+    db.apiKeys.push(apiKey);
+  };
+
+  // ---------------------------------------------------------------------------
+  // TEST 1: Export JSON and CSV formats both work
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const resJson = await service.requestExport('user_123', 'json', 'gdpr_portal_request');
+    assertEquals(resJson.success, true, 'JSON export request should succeed');
+    assertEquals(resJson.status, 'pending', 'JSON export status should start as pending');
+
+    // Process background job synchronously for testing
+    await service.processExportAsync(resJson.export_id);
+
+    const statusJson = await service.getExportStatus(resJson.export_id);
+    assertEquals(statusJson.status, 'completed', 'JSON export status should be completed');
+    assert(statusJson.file_url !== null, 'JSON export file URL should be populated');
+
+    // Verify CSV format
+    const resCsv = await service.requestExport('user_123', 'csv', 'ccpa_portal_request');
+    await service.processExportAsync(resCsv.export_id);
+    const statusCsv = await service.getExportStatus(resCsv.export_id);
+    assertEquals(statusCsv.status, 'completed', 'CSV export status should be completed');
+    assert(statusCsv.file_url !== null, 'CSV export file URL should be populated');
+
+    console.log('✓ Export: JSON and CSV formats both work');
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST 2: Export: All data categories included
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const res = await service.requestExport('user_123', 'json');
+    await service.processExportAsync(res.export_id);
+
+    const s3Key = `export_user_123_${res.export_id}.json`;
+    const fileData = s3.storage.get(s3Key);
+    assert(fileData !== undefined, 'Export file must exist in S3 storage');
+
+    const parsed = JSON.parse(fileData!.body);
+    assertEquals(parsed.profile.id, 'user_123', 'Profile category must be included');
+    assertEquals(parsed.sessions.length, 1, 'Sessions category must be included');
+    assertEquals(parsed.activity.length, 1, 'Activity category must be included');
+    assertEquals(parsed.files.length, 1, 'Files category must be included');
+    assertEquals(parsed.preferences.theme, 'dark', 'Preferences category must be included');
+    assertEquals(parsed.transactions.length, 1, 'Transactions category must be included');
+    assertEquals(parsed.audit_trail.length, 1, 'Audit trail category must be included');
+
+    console.log('✓ Export: All data categories included');
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST 3: Export: Email sent with download link
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const res = await service.requestExport('user_123', 'json');
+    await service.processExportAsync(res.export_id);
+
+    const status = await service.getExportStatus(res.export_id);
+    const sentEmail = email.sentEmails.find(e => e.to === 'alice@example.com');
+    assert(sentEmail !== undefined, 'Email should be sent to the user');
+    assert(sentEmail!.subject.includes('export is ready'), 'Email subject should match');
+    assert(sentEmail!.body.includes(status.file_url!), 'Email body must contain the download link');
+
+    console.log('✓ Export: Email sent with download link');
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST 4: Export: Signed URL works, expires after 7 days
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const res = await service.requestExport('user_123', 'json');
+    await service.processExportAsync(res.export_id);
+
+    const status = await service.getExportStatus(res.export_id);
+    assert(status.expires_at !== null, 'Expiry date must be set');
+
+    const requestedTime = new Date(status.requested_at).getTime();
+    const expiresTime = new Date(status.expires_at!).getTime();
+    const diffDays = (expiresTime - requestedTime) / (1000 * 60 * 60 * 24);
+    assertEquals(Math.round(diffDays), 7, 'Signed URL must expire in exactly 7 days');
+
+    console.log('✓ Export: Signed URL works, expires after 7 days');
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST 5: Deletion: 30-day grace period enforced
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const res = await service.requestDeletion('user_123', 'gdpr_right_to_be_forgotten');
+    assertEquals(res.status, 'pending', 'Deletion request should start as pending');
+
+    // Confirm deletion to move it to approved status
+    const req = db.deletionRequests.find(r => r.id === res.deletion_id)!;
+    await service.confirmDeletion(res.deletion_id, req.confirmation_token);
+
+    // Try to execute scheduled deletions immediately (0 days advanced)
+    let deletedCount = await service.executeScheduledDeletions();
+    assertEquals(deletedCount, 0, 'No deletions should occur before the 30-day grace period');
+
+    // Advance clock by 29 days
+    clock.advanceDays(29);
+    deletedCount = await service.executeScheduledDeletions();
+    assertEquals(deletedCount, 0, 'No deletions should occur at 29 days');
+
+    // Advance clock to 31 days
+    clock.advanceDays(2);
+    deletedCount = await service.executeScheduledDeletions();
+    assertEquals(deletedCount, 1, 'Deletion should execute after 30 days have passed');
+
+    console.log('✓ Deletion: 30-day grace period enforced');
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST 6: Deletion: User can cancel within grace period
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const res = await service.requestDeletion('user_123', 'user_requested');
+    const cancelRes = await service.cancelDeletion(res.deletion_id);
+    assertEquals(cancelRes.status, 'cancelled', 'Cancellation should return cancelled status');
+
+    // Advance clock past grace period and verify no deletion occurs
+    clock.advanceDays(35);
+    const deletedCount = await service.executeScheduledDeletions();
+    assertEquals(deletedCount, 0, 'Cancelled deletion requests must not be executed');
+
+    console.log('✓ Deletion: User can cancel within grace period');
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST 7: Deletion: Cascade delete works
+  // ---------------------------------------------------------------------------
+  {
+    seedUser();
+    const res = await service.requestDeletion('user_12

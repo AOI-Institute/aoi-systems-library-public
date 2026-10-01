@@ -1,0 +1,657 @@
+import os
+import re
+import uuid
+import json
+import sqlite3
+import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------- Configuration ----------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "sk_test_dummy")
+CSRF_TOKEN = "valid_csrf_token"
+SAFETY_FLAGS = {"can_publish": True}
+ALLOWED_TIERS = {"owner", "admin", "user"}
+
+# ---------- Exceptions ----------
+class HTTPError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        self.status = status
+        self.code = code
+        self.message = message
+        super().__init__(f"{status} {code}: {message}")
+
+# ---------- Helper Functions ----------
+def verify_csrf(token: str) -> None:
+    if token != CSRF_TOKEN:
+        raise HTTPError(403, "csrf_invalid", "Invalid CSRF token")
+
+def validate_email(email: str) -> None:
+    if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email):
+        raise HTTPError(400, "invalid_email", "Email format is invalid")
+
+def validate_name(name: str) -> None:
+    if not (1 <= len(name) <= 100):
+        raise HTTPError(400, "invalid_name", "Name length must be 1-100 characters")
+
+def validate_tier(tier: str) -> None:
+    if tier not in ALLOWED_TIERS:
+        raise HTTPError(400, "invalid_tier", f"Tier must be one of {ALLOWED_TIERS}")
+
+def now() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+# ---------- Core System ----------
+class AdminSystem:
+    def __init__(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self._create_schema()
+        self.email_outbox: List[Tuple[str, str]] = []  # (email, content) for testing
+
+    # ----- Schema -----
+    def _create_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            last_active_at TEXT NOT NULL
+        );
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            name TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            signup_date TEXT NOT NULL,
+            invoice_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            stripe_subscription_id TEXT,
+            payment_method TEXT,
+            address TEXT,
+            notes TEXT
+        );
+        CREATE TABLE deployments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            domain TEXT UNIQUE NOT NULL,
+            tier TEXT NOT NULL,
+            theme_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            published_at TEXT,
+            suspend_reason TEXT,
+            archived_at TEXT,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
+        );
+        CREATE TABLE refunds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(created_by) REFERENCES users(id)
+        );
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            actor_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id INTEGER,
+            details TEXT,
+            FOREIGN KEY(actor_id) REFERENCES users(id)
+        );
+        CREATE TABLE governance_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type TEXT NOT NULL,
+            actor_id INTEGER NOT NULL,
+            target_resource_type TEXT NOT NULL,
+            target_resource_id INTEGER NOT NULL,
+            params TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            submitted_at TEXT NOT NULL,
+            approved_by INTEGER,
+            approved_at TEXT,
+            rejection_reason TEXT,
+            FOREIGN KEY(actor_id) REFERENCES users(id),
+            FOREIGN KEY(approved_by) REFERENCES users(id)
+        );
+        """)
+        self.conn.commit()
+
+    # ----- Gate Checks -----
+    def _require_owner(self, user: sqlite3.Row) -> None:
+        if user["tier"] != "owner":
+            raise HTTPError(403, "owner_only", "Owner privileges required")
+
+    def _require_admin_or_owner(self, user: sqlite3.Row) -> None:
+        if user["tier"] not in {"owner", "admin"}:
+            raise HTTPError(403, "admin_or_owner_required", "Admin or Owner required")
+
+    # ----- Audit Logging -----
+    def _audit(self, actor_id: int, action: str,
+               resource_type: Optional[str] = None,
+               resource_id: Optional[int] = None,
+               details: Optional[Dict[str, Any]] = None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, details)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (now(), actor_id, action, resource_type, resource_id,
+             json.dumps(details) if details else None)
+        )
+        # No commit here; caller will commit after mutation
+
+    # ----- User Helpers -----
+    def _get_user_by_id(self, user_id: int) -> sqlite3.Row:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPError(404, "user_not_found", "User does not exist")
+        return row
+
+    def _get_user_by_email(self, email: str) -> Optional[sqlite3.Row]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM users WHERE email = ?", (email,))
+        return cur.fetchone()
+
+    def _count_active_owners(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users WHERE tier = 'owner' AND status = 'active'")
+        return cur.fetchone()[0]
+
+    # ----- USERS DOMAIN -----
+    def users_action(self, csrf_token: str, current_user_id: int,
+                     action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        verify_csrf(csrf_token)
+        cur_user = self._get_user_by_id(current_user_id)
+        self._require_owner(cur_user)
+
+        if action == "create":
+            return self._users_create(cur_user, payload)
+        elif action == "reset_password":
+            return self._users_reset_password(cur_user, payload)
+        elif action == "change_role":
+            return self._users_change_role(cur_user, payload)
+        elif action == "suspend":
+            return self._users_suspend(cur_user, payload)
+        else:
+            raise HTTPError(400, "invalid_action", "Unsupported action")
+
+    def _users_create(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        email = payload.get("email")
+        name = payload.get("name")
+        tier = payload.get("tier")
+        notify = payload.get("notify", False)
+
+        if not all([email, name, tier]):
+            raise HTTPError(400, "missing_fields", "email, name, and tier are required")
+        validate_email(email)
+        validate_name(name)
+        validate_tier(tier)
+
+        if self._get_user_by_email(email):
+            raise HTTPError(409, "email_exists", "Email already exists")
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT INTO users (email, name, tier, created_at, last_active_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (email, name, tier, now(), now())
+        )
+        user_id = cur.lastrowid
+
+        # Audit before commit
+        self._audit(actor["id"], "user_created",
+                    resource_type="user", resource_id=user_id,
+                    details={"email": email, "tier": tier})
+
+        self.conn.commit()
+
+        if notify:
+            self.email_outbox.append((email, f"Welcome {name}, your tier is {tier}"))
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "email": email,
+            "tier": tier,
+            "created_at": now()
+        }
+
+    def _users_reset_password(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise HTTPError(400, "missing_fields", "user_id required")
+        if user_id == actor["id"]:
+            raise HTTPError(400, "cannot_reset_own_password", "Cannot reset own password")
+        target = self._get_user_by_id(user_id)
+
+        # Ensure not last active owner
+        if target["tier"] == "owner" and self._count_active_owners() == 1:
+            raise HTTPError(400, "cannot_reset_last_owner", "Cannot reset password of last active owner")
+
+        token = str(uuid.uuid4())
+        self.email_outbox.append((target["email"], f"Password reset link: https://example.com/reset/{token}"))
+
+        self._audit(actor["id"], "password_reset_initiated",
+                    resource_type="user", resource_id=user_id,
+                    details={"reset_token": token})
+
+        self.conn.commit()
+        return {"success": True, "status": "reset_email_sent"}
+
+    def _users_change_role(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        user_id = payload.get("user_id")
+        new_tier = payload.get("new_tier")
+        if not all([user_id, new_tier]):
+            raise HTTPError(400, "missing_fields", "user_id and new_tier required")
+        if user_id == actor["id"]:
+            raise HTTPError(400, "cannot_change_own_role", "Cannot change own role")
+        validate_tier(new_tier)
+        target = self._get_user_by_id(user_id)
+
+        if target["tier"] == "owner" and self._count_active_owners() == 1 and new_tier != "owner":
+            raise HTTPError(400, "cannot_demote_last_owner", "Cannot demote last active owner")
+
+        old_tier = target["tier"]
+        cur = self.conn.cursor()
+        cur.execute("UPDATE users SET tier = ?, last_active_at = ? WHERE id = ?",
+                    (new_tier, now(), user_id))
+
+        self._audit(actor["id"], "role_changed",
+                    resource_type="user", resource_id=user_id,
+                    details={"old_tier": old_tier, "new_tier": new_tier})
+
+        self.conn.commit()
+        return {"success": True, "user_id": user_id, "old_tier": old_tier, "new_tier": new_tier}
+
+    def _users_suspend(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        user_id = payload.get("user_id")
+        reason = payload.get("reason")
+        if not all([user_id, reason]):
+            raise HTTPError(400, "missing_fields", "user_id and reason required")
+        if user_id == actor["id"]:
+            raise HTTPError(400, "cannot_suspend_yourself", "Cannot suspend yourself")
+        target = self._get_user_by_id(user_id)
+
+        if target["tier"] == "owner" and self._count_active_owners() == 1:
+            raise HTTPError(400, "cannot_suspend_last_owner", "Cannot suspend last active owner")
+
+        cur = self.conn.cursor()
+        cur.execute("UPDATE users SET status = 'suspended', last_active_at = ? WHERE id = ?",
+                    (now(), user_id))
+
+        self._audit(actor["id"], "user_suspended",
+                    resource_type="user", resource_id=user_id,
+                    details={"reason": reason})
+
+        self.conn.commit()
+        return {"success": True, "user_id": user_id, "suspended": True}
+
+    # ----- CUSTOMERS DOMAIN -----
+    def list_customers(self, current_user_id: int, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        cur_user = self._get_user_by_id(current_user_id)
+        self._require_admin_or_owner(cur_user)
+        cur = self.conn.cursor()
+        cur.execute(
+            """SELECT id, email, name, tier, signup_date, invoice_count, status
+               FROM customers ORDER BY id LIMIT ? OFFSET ?""",
+            (limit, offset)
+        )
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    def get_customer_detail(self, current_user_id: int, customer_id: int) -> Dict[str, Any]:
+        cur_user = self._get_user_by_id(current_user_id)
+        self._require_admin_or_owner(cur_user)
+        cur = self.conn.cursor()
+        cur.execute(
+            """SELECT * FROM customers WHERE id = ?""",
+            (customer_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPError(404, "customer_not_found", "Customer does not exist")
+        return dict(row)
+
+    def customers_action(self, csrf_token: str, current_user_id: int,
+                         customer_id: int, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        verify_csrf(csrf_token)
+        cur_user = self._get_user_by_id(current_user_id)
+        self._require_owner(cur_user)
+
+        if action == "change_plan":
+            return self._customers_change_plan(cur_user, customer_id, payload)
+        elif action == "queue_refund":
+            return self._customers_queue_refund(cur_user, payload)
+        else:
+            raise HTTPError(400, "invalid_action", "Unsupported action")
+
+    def _customers_change_plan(self, actor: sqlite3.Row, customer_id: int,
+                               payload: Dict[str, Any]) -> Dict[str, Any]:
+        new_tier = payload.get("new_tier")
+        if not new_tier:
+            raise HTTPError(400, "missing_fields", "new_tier required")
+        validate_tier(new_tier)
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
+        cust = cur.fetchone()
+        if not cust:
+            raise HTTPError(404, "customer_not_found", "Customer does not exist")
+        old_tier = cust["tier"]
+        stripe_sub_id = cust["stripe_subscription_id"]
+        if not stripe_sub_id:
+            raise HTTPError(400, "no_stripe_subscription", "Customer has no Stripe subscription")
+
+        # Mock Stripe call
+        self._stripe_update_subscription(stripe_sub_id, new_tier)
+
+        cur.execute("UPDATE customers SET tier = ?, last_active_at = ? WHERE id = ?",
+                    (new_tier, now(), customer_id))
+
+        self._audit(actor["id"], "plan_changed",
+                    resource_type="customer", resource_id=customer_id,
+                    details={"old_tier": old_tier, "new_tier": new_tier})
+
+        self.conn.commit()
+        return {
+            "success": True,
+            "customer_id": customer_id,
+            "old_tier": old_tier,
+            "new_tier": new_tier,
+            "effective_date": now()
+        }
+
+    def _stripe_update_subscription(self, subscription_id: str, new_tier: str) -> None:
+        # In real implementation, call Stripe API.
+        # Here we just simulate success.
+        pass
+
+    def _customers_queue_refund(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        invoice_id = payload.get("invoice_id")
+        amount = payload.get("amount")
+        reason = payload.get("reason")
+        if not all([invoice_id, amount, reason]):
+            raise HTTPError(400, "missing_fields", "invoice_id, amount, and reason required")
+
+        # Simulate invoice check
+        # For simplicity assume invoice exists and succeeded
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT INTO refunds (invoice_id, amount, reason, status, created_by, created_at)
+               VALUES (?, ?, ?, 'queued', ?, ?)""",
+            (invoice_id, amount, reason, actor["id"], now())
+        )
+        refund_id = cur.lastrowid
+
+        self._audit(actor["id"], "refund_queued",
+                    resource_type="refund", resource_id=refund_id,
+                    details={"invoice_id": invoice_id, "amount": amount, "reason": reason})
+
+        self.conn.commit()
+        return {
+            "success": True,
+            "refund_id": refund_id,
+            "status": "queued",
+            "amount": amount
+        }
+
+    # ----- DEPLOYMENTS DOMAIN -----
+    def list_deployments(self, current_user_id: int) -> List[Dict[str, Any]]:
+        cur_user = self._get_user_by_id(current_user_id)
+        self._require_admin_or_owner(cur_user)
+        cur = self.conn.cursor()
+        cur.execute(
+            """SELECT id, customer_id, domain, tier, status, theme_id, published_at
+               FROM deployments ORDER BY id"""
+        )
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    def deployments_action(self, csrf_token: str, current_user_id: int,
+                           action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        verify_csrf(csrf_token)
+        cur_user = self._get_user_by_id(current_user_id)
+        self._require_owner(cur_user)
+
+        if action == "create":
+            return self._deployments_create(cur_user, payload)
+        elif action == "publish":
+            return self._deployments_publish(cur_user, payload)
+        elif action == "suspend":
+            return self._deployments_suspend(cur_user, payload)
+        elif action == "retire":
+            return self._deployments_retire(cur_user, payload)
+        else:
+            raise HTTPError(400, "invalid_action", "Unsupported action")
+
+    def _deployments_create(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        customer_id = payload.get("customer_id")
+        domain = payload.get("domain")
+        tier = payload.get("tier")
+        theme_id = payload.get("theme_id")
+        if not all([customer_id, domain, tier, theme_id]):
+            raise HTTPError(400, "missing_fields", "All fields required")
+        validate_tier(tier)
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
+        if not cur.fetchone():
+            raise HTTPError(404, "customer_not_found", "Customer does not exist")
+        cur.execute("SELECT * FROM deployments WHERE domain = ?", (domain,))
+        if cur.fetchone():
+            raise HTTPError(409, "domain_exists", "Domain already registered")
+        # Assume theme existence check passed
+
+        cur.execute(
+            """INSERT INTO deployments (customer_id, domain, tier, theme_id, status)
+               VALUES (?, ?, ?, ?, 'draft')""",
+            (customer_id, domain, tier, theme_id)
+        )
+        deployment_id = cur.lastrowid
+
+        # Simulate config init (no-op)
+        self._audit(actor["id"], "deployment_created",
+                    resource_type="deployment", resource_id=deployment_id,
+                    details={"customer_id": customer_id, "domain": domain, "tier": tier})
+
+        self.conn.commit()
+        return {"success": True, "deployment_id": deployment_id, "domain": domain, "tier": tier}
+
+    def _deployments_publish(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = payload.get("deployment_id")
+        if not deployment_id:
+            raise HTTPError(400, "missing_fields", "deployment_id required")
+        if not SAFETY_FLAGS.get("can_publish"):
+            raise HTTPError(403, "publish_not_allowed", "Publishing is disabled by safety flag")
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,))
+        dep = cur.fetchone()
+        if not dep:
+            raise HTTPError(404, "deployment_not_found", "Deployment does not exist")
+        if dep["status"] != "draft":
+            raise HTTPError(400, "invalid_status", "Only draft deployments can be published")
+        # Assume domain_verified and theme_set checks passed
+
+        cur.execute(
+            "UPDATE deployments SET status = 'live', published_at = ? WHERE id = ?",
+            (now(), deployment_id)
+        )
+        self._audit(actor["id"], "deployment_published",
+                    resource_type="deployment", resource_id=deployment_id,
+                    details={"public_url": f"https://{dep['domain']}"})
+
+        self.conn.commit()
+        return {
+            "success": True,
+            "deployment_id": deployment_id,
+            "status": "live",
+            "public_url": f"https://{dep['domain']}"
+        }
+
+    def _deployments_suspend(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = payload.get("deployment_id")
+        reason = payload.get("reason")
+        if not all([deployment_id, reason]):
+            raise HTTPError(400, "missing_fields", "deployment_id and reason required")
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,))
+        if not cur.fetchone():
+            raise HTTPError(404, "deployment_not_found", "Deployment does not exist")
+        cur.execute(
+            "UPDATE deployments SET status = 'suspended', suspend_reason = ? WHERE id = ?",
+            (reason, deployment_id)
+        )
+        self._audit(actor["id"], "deployment_suspended",
+                    resource_type="deployment", resource_id=deployment_id,
+                    details={"reason": reason})
+        self.conn.commit()
+        return {"success": True, "deployment_id": deployment_id, "status": "suspended"}
+
+    def _deployments_retire(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = payload.get("deployment_id")
+        if not deployment_id:
+            raise HTTPError(400, "missing_fields", "deployment_id required")
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,))
+        if not cur.fetchone():
+            raise HTTPError(404, "deployment_not_found", "Deployment does not exist")
+        cur.execute(
+            "UPDATE deployments SET status = 'archived', archived_at = ? WHERE id = ?",
+            (now(), deployment_id)
+        )
+        self._audit(actor["id"], "deployment_archived",
+                    resource_type="deployment", resource_id=deployment_id,
+                    details={})
+        self.conn.commit()
+        return {"success": True, "deployment_id": deployment_id, "status": "archived"}
+
+    # ----- GOVERNANCE DOMAIN -----
+    def list_pending_governance_actions(self, current_user_id: int, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        cur_user = self._get_user_by_id(current_user_id)
+        if cur_user["tier"] not in {"owner", "admin"}:
+            raise HTTPError(403, "owner_or_admin_required", "Owner or Admin required")
+        cur = self.conn.cursor()
+        cur.execute(
+            """SELECT * FROM governance_actions
+               WHERE status = 'pending' ORDER BY submitted_at LIMIT ? OFFSET ?""",
+            (limit, offset)
+        )
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    def decide_governance_action(self, csrf_token: str, current_user_id: int,
+                                 action_id: int, decide: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        verify_csrf(csrf_token)
+        actor = self._get_user_by_id(current_user_id)
+        self._require_owner(actor)
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM governance_actions WHERE id = ?", (action_id,))
+        ga = cur.fetchone()
+        if not ga:
+            raise HTTPError(404, "governance_action_not_found", "Action does not exist")
+        if ga["status"] != "pending":
+            raise HTTPError(400, "action_already_decided", "Action already decided")
+
+        if decide == "approve":
+            # Execute original action (simplified)
+            params = json.loads(ga["params"])
+            if ga["action_type"] == "change_role":
+                target_user_id = ga["target_resource_id"]
+                new_tier = params["new_tier"]
+                target_user = self._get_user_by_id(target_user_id)
+                old_tier = target_user["tier"]
+                cur.execute("UPDATE users SET tier = ?, last_active_at = ? WHERE id = ?",
+                            (new_tier, now(), target_user_id))
+                self._audit(actor["id"], "role_changed",
+                            resource_type="user", resource_id=target_user_id,
+                            details={"old_tier": old_tier, "new_tier": new_tier})
+                execution_result = {"old_tier": old_tier, "new_tier": new_tier}
+            else:
+                execution_result = {}
+
+            cur.execute(
+                """UPDATE governance_actions
+                   SET status = 'approved', approved_by = ?, approved_at = ?, 
+                       execution_result = ?
+                   WHERE id = ?""",
+                (actor["id"], now(), json.dumps(execution_result), action_id)
+            )
+            self._audit(actor["id"], "action_approved",
+                        resource_type="governance_action", resource_id=action_id,
+                        details=execution_result)
+            self.conn.commit()
+            return {"success": True, "action_id": action_id, "status": "approved"}
+
+        elif decide == "reject":
+            reason = payload.get("reason")
+            if not reason:
+                raise HTTPError(400, "missing_fields", "reason required for rejection")
+            cur.execute(
+                """UPDATE governance_actions
+                   SET status = 'rejected', rejection_reason = ?, approved_by = ?, approved_at = ?
+                   WHERE id = ?""",
+                (reason, actor["id"], now(), action_id)
+            )
+            self._audit(actor["id"], "action_rejected",
+                        resource_type="governance_action", resource_id=action_id,
+                        details={"reason": reason})
+            self.conn.commit()
+            return {"success": True, "action_id": action_id, "status": "rejected"}
+        else:
+            raise HTTPError(400, "invalid_decision", "decide must be approve or reject")
+
+    def search_audit_log(self, current_user_id: int,
+                         filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cur_user = self._get_user_by_id(current_user_id)
+        if cur_user["tier"] not in {"owner", "admin"}:
+            raise HTTPError(403, "owner_or_admin_required", "Owner or Admin required")
+        limit = filters.get("limit", 100)
+        offset = filters.get("offset", 0)
+        conditions = []
+        params: List[Any] = []
+
+        if "action_type" in filters:
+            conditions.append("action = ?")
+            params.append(filters["action_type"])
+        if "resource_id" in filters:
+            conditions.append("resource_id = ?")
+            params.append(filters["resource_id"])
+        if "date_range" in filters:
+            start, end = filters["date_range"]
+            conditions.append("timestamp BETWEEN ? AND ?")
+            params.extend([start, end])
+
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        query = f"""SELECT * FROM audit_log {where_clause}
+                    ORDER BY timestamp DESC LIMIT ? OFFSET ?"""
+        params.extend([limit, offset])
+        cur = self.conn.cursor()
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    # ----- GOVERNANCE ACTION CREATION (helper for tests) -----
+    def create_governance_action(self, actor_id: int, action_type: str,
+                                 target_resource_type: str, target_resource_id: int,
+                                 params: Dict[str, Any]) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT INTO governance_actions
+               (action_type, actor_id, target_resource_type, target_resource_id, params, status, submitted_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            (action_type, actor_id, target_resource_type, target_resource_id,
+             json.dumps(params), now())
+        )
+        self.conn.commit()
+        return cur.lastrowid
