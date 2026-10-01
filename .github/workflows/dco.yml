@@ -1,0 +1,35 @@
+# Fails a pull request when a commit lacks a Developer Certificate of Origin sign-off that matches its author
+# (tools/check_dco.py; CONTRIBUTING.md "Sign-off (DCO)").
+#
+# The checker runs from the BASE branch when the base has one, so a pull request cannot weaken the check by
+# editing tools/check_dco.py. (A pull request that edits this workflow file itself still runs its own copy:
+# review changes under .github/ before merging.)
+name: dco
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: dco
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12"}
+
+      - name: Check sign-off on every commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git show "$BASE:tools/check_dco.py" > "$RUNNER_TEMP/check_dco.py" 2>/dev/null \
+            || cp tools/check_dco.py "$RUNNER_TEMP/check_dco.py"
+          python "$RUNNER_TEMP/check_dco.py" "$BASE" "$HEAD"
