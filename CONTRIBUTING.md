@@ -20,9 +20,10 @@ Every commit must carry a `Signed-off-by:` line, certifying the
 
 Forgot? `git commit --amend -s` (last commit) or `git rebase --signoff main` (a branch).
 
-A `dco` check runs on every pull request. It fails when a commit has no `Signed-off-by:` line, or one
-whose email is not the commit's author email, and its log says how to fix it. Merge commits and GitHub's
-own bots are not checked.
+A `dco` check runs on every pull request. It fails when a commit has no `Signed-off-by:` line whose email
+is the commit's author or committer email, and its log says how to fix it. Merge commits and commits whose
+author name ends in `[bot]` (bots such as Dependabot) are not checked.
+
 Contributions are licensed under Apache-2.0, as is the rest of the repository.
 
 ## Running tests
